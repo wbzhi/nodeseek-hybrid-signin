@@ -18,6 +18,7 @@ License: MIT
 import os
 import time
 import json
+import base64
 import random
 import traceback
 import logging
@@ -95,6 +96,39 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
+def parse_member_id_from_cookie(cookie: str) -> Optional[int]:
+    """从 Cookie 的 pjwt 中解析成员 ID"""
+    if not cookie:
+        return None
+    try:
+        for item in cookie.split(";"):
+            item = item.strip()
+            if item.startswith("pjwt="):
+                token = item[len("pjwt="):].strip()
+                # pjwt 不是标准三段 JWT: 逐段尝试解码, 取含 id 的 JSON 段
+                for part in token.split("."):
+                    try:
+                        payload_b64 = part + "=" * (-len(part) % 4)
+                        payload = json.loads(base64.urlsafe_b64decode(payload_b64.encode("utf-8")))
+                        if isinstance(payload, dict) and payload.get("id") is not None:
+                            return int(payload["id"])
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return None
+
+def normalize_user_info(detail: Dict[str, Any], fallback_id: Optional[int] = None) -> Dict[str, Any]:
+    """统一用户信息字段 (来自 /api/account/getInfo 的 detail)"""
+    return {
+        'member_id': detail.get('member_id', fallback_id),
+        'member_name': detail.get('member_name', ''),
+        'rank': detail.get('rank', ''),
+        'coin': detail.get('coin', ''),
+        'nPost': detail.get('nPost', ''),
+        'nComment': detail.get('nComment', ''),
+    }
+
 @dataclass
 class SigninResult:
     """签到结果数据类"""
@@ -103,6 +137,7 @@ class SigninResult:
     method: str  # 'http', 'proxy', 'selenium'
     cookie_expired: bool = False  # Cookie是否过期
     statistics: Optional[Dict] = None
+    user_info: Optional[Dict] = None  # 用户信息 (用户名/等级/鸡腿/主题/评论)
 
 @dataclass  
 class AccountConfig:
@@ -226,6 +261,32 @@ class StatisticsTracker:
             
         except Exception as e:
             return None, f"统计查询异常: {str(e)}"
+
+    def get_user_info(self) -> Optional[Dict]:
+        """获取账户用户信息 (用户名/等级/鸡腿总数/主题帖数/评论数)"""
+        member_id = parse_member_id_from_cookie(self.cookie)
+        if not member_id:
+            return None
+        try:
+            headers = {
+                'User-Agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                'Cookie': self.cookie
+            }
+            url = f"https://www.nodeseek.com/api/account/getInfo/{member_id}?readme=1"
+            if USE_CURL_CFFI:
+                try:
+                    response = cf_requests.get(url, headers=headers, timeout=10, impersonate="chrome120")
+                except:
+                    response = cf_requests.get(url, headers=headers, timeout=10)
+            else:
+                response = cf_requests.get(url, headers=headers, timeout=10)
+            data = response.json()
+            detail = data.get("detail") if isinstance(data, dict) else None
+            if detail:
+                return normalize_user_info(detail, member_id)
+        except Exception as e:
+            logging.warning(f"⚠️  用户信息查询失败: {str(e)}")
+        return None
 
 class HTTPSigner:
     """HTTP 签到器 (轻量级方案)"""
@@ -382,6 +443,26 @@ class SeleniumSigner:
             """
         })
         
+    def _fetch_user_info(self, member_id: int) -> Optional[Dict]:
+        """在已登录的浏览器会话内获取用户信息 (同源 fetch, 不受 Cloudflare 拦截)"""
+        try:
+            self.driver.set_script_timeout(15)
+            data = self.driver.execute_async_script("""
+                var mid = arguments[0];
+                var done = arguments[arguments.length - 1];
+                fetch('/api/account/getInfo/' + mid + '?readme=1', {credentials: 'include'})
+                    .then(function(r) { return r.json(); })
+                    .then(function(d) { done(d); })
+                    .catch(function(e) { done(null); });
+            """, member_id)
+            if isinstance(data, dict):
+                detail = data.get('detail')
+                if detail:
+                    return normalize_user_info(detail, member_id)
+        except Exception as e:
+            logging.warning(f"⚠️  Selenium 获取用户信息失败: {str(e)}")
+        return None
+
     def signin(self, cookie: str) -> SigninResult:
         """Selenium 签到"""
         try:
@@ -438,7 +519,11 @@ class SeleniumSigner:
             if not buttons:
                 # 已签到
                 info_text = head_info.text.strip()
-                return SigninResult(True, f"今日已签到: {info_text}", "selenium")
+                result = SigninResult(True, f"今日已签到: {info_text}", "selenium")
+                member_id = parse_member_id_from_cookie(cookie)
+                if member_id:
+                    result.user_info = self._fetch_user_info(member_id)
+                return result
             
             # 执行签到
             sign_div = WebDriverWait(self.driver, 15).until(
@@ -457,8 +542,13 @@ class SeleniumSigner:
             self.driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
             time.sleep(0.5)
             button.click()
-            
-            return SigninResult(True, f"Selenium 签到成功 ({mode})", "selenium")
+            time.sleep(2)
+
+            result = SigninResult(True, f"Selenium 签到成功 ({mode})", "selenium")
+            member_id = parse_member_id_from_cookie(cookie)
+            if member_id:
+                result.user_info = self._fetch_user_info(member_id)
+            return result
             
         except Exception as e:
             error_msg = str(e)
@@ -616,6 +706,16 @@ class NodeSeekHybridSigner:
             # 增强统计信息
             if result.success and account.cookie:
                 result = self.enhance_with_statistics(result, account.cookie)
+
+            # 附加用户信息 (Selenium 路径已在浏览器内取到的不重复取)
+            if result.success and account.cookie and not result.user_info:
+                try:
+                    result.user_info = StatisticsTracker(account.cookie).get_user_info()
+                except Exception as e:
+                    logging.warning(f"⚠️  用户信息获取失败: {str(e)}")
+            if result.user_info:
+                _info = result.user_info
+                logging.info(f"👤 用户信息: {_info.get('member_name')} (ID {_info.get('member_id')}) 等级 {_info.get('rank')} 鸡腿 {_info.get('coin')} 主题 {_info.get('nPost')} 评论 {_info.get('nComment')}")
             
             # 记录结果
             results.append((account, result))
@@ -684,6 +784,12 @@ class NodeSeekHybridSigner:
                     summary_msg += f"📱 账户{i}：{drumstick_info}\n"
                 else:
                     summary_msg += f"📱 账户{i}：{result.message}\n"
+                if result.user_info:
+                    _info = result.user_info
+                    _name = str(_info.get('member_name', '')).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                    summary_msg += f"👤 用户：{_name}（ID {_info.get('member_id', '')}）\n"
+                    summary_msg += f"🏅 等级：{_info.get('rank', '')}｜🍗 鸡腿总数：{_info.get('coin', '')}\n"
+                    summary_msg += f"📝 主题帖数：{_info.get('nPost', '')}｜💬 评论数：{_info.get('nComment', '')}\n"
             summary_msg += "\n"
         
         # 失败账户处理
