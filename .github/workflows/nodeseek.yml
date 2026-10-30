@@ -2,8 +2,8 @@ name: NodeSeek 混合签到器
 
 on:
   schedule:
-    # 每天北京时间上午8:30运行 (UTC 00:30)
-    - cron: '30 0 * * *'
+    # 每天北京时间上午9:25运行 (UTC 01:25)
+    - cron: '25 1 * * *'
   workflow_dispatch:
     inputs:
       enable_statistics:
